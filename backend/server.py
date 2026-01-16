@@ -1,14 +1,19 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.responses import RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List
-import uuid
+from pydantic import BaseModel, Field, HttpUrl
+from typing import Optional, List
+import string
+import random
 from datetime import datetime
+import qrcode
+import io
+import base64
 
 
 ROOT_DIR = Path(__file__).parent
@@ -27,30 +32,136 @@ api_router = APIRouter(prefix="/api")
 
 
 # Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+class ShortenRequest(BaseModel):
+    original_url: str
+    custom_code: Optional[str] = None
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+class URLResponse(BaseModel):
+    original_url: str
+    short_code: str
+    clicks: int
+    created_at: datetime
+    qr_code: str
+    custom: bool
 
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
-async def root():
-    return {"message": "Hello World"}
+class StatsResponse(BaseModel):
+    short_code: str
+    clicks: int
+    original_url: str
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
+# Helper function to generate random short code
+def generate_short_code(length=6):
+    characters = string.ascii_letters + string.digits
+    return ''.join(random.choice(characters) for _ in range(length))
+
+
+# Helper function to generate QR code as base64
+def generate_qr_code(url: str) -> str:
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Convert to base64
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    buffer.seek(0)
+    img_base64 = base64.b64encode(buffer.getvalue()).decode()
+    
+    return f"data:image/png;base64,{img_base64}"
+
+
+@api_router.post("/shorten", response_model=URLResponse)
+async def shorten_url(request: ShortenRequest):
+    """Create a shortened URL"""
+    
+    # If custom code provided, check if it's available
+    if request.custom_code:
+        existing = await db.urls.find_one({"short_code": request.custom_code})
+        if existing:
+            raise HTTPException(status_code=400, detail="Custom code already taken")
+        short_code = request.custom_code
+        custom = True
+    else:
+        # Generate random code and ensure it's unique
+        while True:
+            short_code = generate_short_code()
+            existing = await db.urls.find_one({"short_code": short_code})
+            if not existing:
+                break
+        custom = False
+    
+    # Generate QR code
+    full_url = f"{request.original_url}"
+    qr_code_base64 = generate_qr_code(full_url)
+    
+    # Create URL document
+    url_doc = {
+        "original_url": request.original_url,
+        "short_code": short_code,
+        "clicks": 0,
+        "created_at": datetime.utcnow(),
+        "qr_code": qr_code_base64,
+        "custom": custom
+    }
+    
+    await db.urls.insert_one(url_doc)
+    
+    return URLResponse(**url_doc)
+
+
+@api_router.get("/urls", response_model=List[URLResponse])
+async def get_all_urls():
+    """Get all shortened URLs"""
+    urls = await db.urls.find().sort("created_at", -1).to_list(1000)
+    return [URLResponse(**url) for url in urls]
+
+
+@api_router.delete("/urls/{short_code}")
+async def delete_url(short_code: str):
+    """Delete a shortened URL"""
+    result = await db.urls.delete_one({"short_code": short_code})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="URL not found")
+    return {"message": "URL deleted successfully"}
+
+
+@api_router.get("/stats/{short_code}", response_model=StatsResponse)
+async def get_stats(short_code: str):
+    """Get statistics for a shortened URL"""
+    url = await db.urls.find_one({"short_code": short_code})
+    if not url:
+        raise HTTPException(status_code=404, detail="URL not found")
+    
+    return StatsResponse(
+        short_code=url["short_code"],
+        clicks=url["clicks"],
+        original_url=url["original_url"]
+    )
+
+
+@api_router.get("/{short_code}")
+async def redirect_url(short_code: str):
+    """Redirect to original URL and increment click count"""
+    url = await db.urls.find_one({"short_code": short_code})
+    if not url:
+        raise HTTPException(status_code=404, detail="URL not found")
+    
+    # Increment click count
+    await db.urls.update_one(
+        {"short_code": short_code},
+        {"$inc": {"clicks": 1}}
+    )
+    
+    return RedirectResponse(url=url["original_url"])
+
 
 # Include the router in the main app
 app.include_router(api_router)
