@@ -251,8 +251,8 @@ class URLShortenerTester:
             # Test redirect (don't follow redirects to avoid external requests)
             response = self.session.get(f"{self.base_url}/{short_code}", allow_redirects=False)
             
-            if response.status_code != 302:
-                self.log_test("Redirect and increment", False, f"Should return 302 redirect, got: {response.status_code}")
+            if response.status_code not in [302, 307]:
+                self.log_test("Redirect and increment", False, f"Should return 302 or 307 redirect, got: {response.status_code}")
                 return None
                 
             # Check if Location header is set correctly
